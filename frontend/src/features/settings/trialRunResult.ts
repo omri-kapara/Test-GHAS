@@ -1,0 +1,115 @@
+/** F2 trial-run result lines + estimate copy. Pure helpers for the connection card. */
+
+export type TrialResultLike = {
+  ok?: boolean
+  success?: boolean
+  probe_kind?: 'quick' | 'trial'
+  trial_context_ok?: boolean | null
+  trial_rate_limited?: boolean | null
+  trial_json_ok?: boolean | null
+  trial_avg_ms?: number | null
+  trial_estimate_requests?: number | null
+  trial_estimate_minutes?: number | null
+  trial_passed?: boolean | null
+  trial_failure_reason?: string | null
+  trial_failure_status?: number | null
+}
+
+export type TrialLineTone = 'ok' | 'warn' | 'fail'
+
+export type TrialLine = {
+  key: 'context' | 'rate' | 'json'
+  tone: TrialLineTone
+  /** Chinese source string used as i18n key. */
+  label: string
+}
+
+export function trialLines(result: TrialResultLike | null | undefined): TrialLine[] {
+  // Only a successful trial probe may paint the three lights. A failed address/key/kind
+  // check used to hard-code trial_*=false and still render a fake 「速率 ✓」.
+  if (!result || result.probe_kind !== 'trial') return []
+  if (result.ok === false || result.success === false) return []
+  const contextOk = result.trial_context_ok === true
+  const rateLimited = result.trial_rate_limited === true
+  const jsonOk = result.trial_json_ok === true
+  return [
+    {
+      key: 'context',
+      tone: contextOk ? 'ok' : 'fail',
+      label: contextOk ? '上下文 ✓' : '上下文 ✗',
+    },
+    {
+      key: 'rate',
+      tone: rateLimited ? 'warn' : 'ok',
+      label: rateLimited ? '速率 ⚠（出现限流，长视频建议降并发）' : '速率 ✓',
+    },
+    {
+      key: 'json',
+      tone: jsonOk ? 'ok' : 'fail',
+      label: jsonOk ? '输出格式 ✓' : '输出格式 ✗',
+    },
+  ]
+}
+
+export function trialEstimateCopy(result: TrialResultLike | null | undefined): string {
+  if (!result || result.probe_kind !== 'trial') return ''
+  const n = result.trial_estimate_requests
+  const m = result.trial_estimate_minutes
+  if (typeof n !== 'number' || typeof m !== 'number') return ''
+  // Concrete Chinese string remains the i18n key fallback when templates are missing.
+  return `预计 30 分钟素材约需 ${n} 次请求、约 ${m} 分钟`
+}
+
+export function trialEstimateParts(result: TrialResultLike | null | undefined): { n: number; m: number } | null {
+  if (!result || result.probe_kind !== 'trial') return null
+  const n = result.trial_estimate_requests
+  const m = result.trial_estimate_minutes
+  if (typeof n !== 'number' || typeof m !== 'number') return null
+  return { n, m }
+}
+
+export function showTrialFailedBadge(connection: {
+  trial_status?: string
+  validation_status?: string
+} | null | undefined): boolean {
+  return connection?.trial_status === 'failed'
+}
+
+export function trialPassedOverall(result: TrialResultLike | null | undefined): boolean {
+  return result?.probe_kind === 'trial' && result.trial_passed === true
+}
+
+export type TrialFailureDetail = {
+  key: string
+  status?: number
+}
+
+/** Closed-set explanation for why a trial run failed (never raw upstream text). */
+export function trialFailureDetail(result: TrialResultLike | null | undefined): TrialFailureDetail | null {
+  if (!result || result.probe_kind !== 'trial') return null
+  if (result.ok === false || result.success === false) return null
+  if (result.trial_passed === true) return null
+  const reason = (result.trial_failure_reason || '').trim()
+  const status = typeof result.trial_failure_status === 'number'
+    && Number.isInteger(result.trial_failure_status)
+    && result.trial_failure_status >= 400
+    && result.trial_failure_status <= 599
+    ? result.trial_failure_status
+    : undefined
+  switch (reason) {
+    case 'timeout':
+      return { key: '试跑请求超时（90 秒）。本地小算力模型可先保存后用短素材实测，或换更轻量的型号。' }
+    case 'connection':
+      return { key: '试跑时连接中断，请检查服务是否仍在运行或网络代理设置。' }
+    case 'context_length':
+      return { key: '模型上下文长度不足以处理试跑样本，请改用更大上下文的型号或调小分块大小。' }
+    case 'http_error':
+      return status !== undefined
+        ? { key: '试跑请求被服务商拒绝（HTTP {{status}}），请检查模型权限、额度或接口兼容性。', status }
+        : { key: '试跑请求失败，请检查模型权限、额度或接口兼容性。' }
+    case 'invalid_json':
+      return { key: '模型已回复，但未按要求输出有效 JSON，建议换指令遵循更稳定的型号。' }
+    default:
+      return null
+  }
+}
