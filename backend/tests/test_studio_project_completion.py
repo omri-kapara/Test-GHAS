@@ -1,0 +1,280 @@
+"""A completed automatic visual render must settle the actual project list too."""
+import json
+
+import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
+from backend.models.base import Base
+from backend.models.project import Project, ProjectStatus
+from backend.schemas.base import PaginationParams
+from backend.schemas.project import ProjectFilter, ProjectStatus as ResponseStatus
+from backend.services.project_service import ProjectService
+from backend.services.studio import jobs, store
+
+
+@pytest.fixture
+def project(tmp_path, monkeypatch):
+    monkeypatch.setenv('AUTOCLIP_DATA_DIR', str(tmp_path))
+    monkeypatch.setenv('AUTOCLIP_APP_DIR', str(tmp_path))
+    (store.directory('visual') / 'metadata').mkdir(parents=True)
+    engine = create_engine('sqlite:///:memory:')
+    Base.metadata.create_all(engine)
+    sessions = sessionmaker(bind=engine)
+    monkeypatch.setattr('backend.core.database.SessionLocal', sessions)
+    with sessions() as db:
+        db.add(Project(id='visual', name='公开 游戏', status=ProjectStatus.PROCESSING,
+                       processing_config={'smart_import': {'auto_start': True}, 'creative': {'goal': 'highlight'}, 'kept': 'original'},
+                       project_metadata={'kept': 'original'}))
+        db.commit()
+    yield sessions
+    engine.dispose()
+
+
+def state(statuses):
+    return {'generation': {'status': 'rendering', 'auto_start': True},
+            'analysis': {'status': 'running', 'phase': 'rendering', 'run_id': 'flow', 'instance': store.INSTANCE},
+            'drafts': [{'id': 'draft-' + str(i)} for i in range(len(statuses))],
+            'jobs': [{'job_id': 'job-' + str(i), 'status': status, 'instance': store.INSTANCE} for i, status in enumerate(statuses)],
+            'output_variants': [{'id': str(i), 'render_job_id': 'job-' + str(i), 'status': status, 'instance': store.INSTANCE} for i, status in enumerate(statuses)]}
+
+
+def test_last_visual_render_finishes_database_and_home(project):
+    store.write('visual', state(['completed', 'running', 'on_demand']))
+    jobs._sync_variant_status('visual', 'job-1', 'completed')
+    with project() as db:
+        row = db.get(Project, 'visual')
+        assert row.status is ProjectStatus.COMPLETED
+        assert row.completed_at is not None
+        assert row.processing_config['kept'] == 'original'
+        assert row.project_metadata == {'kept': 'original'}
+        response = ProjectService(db).get_projects_paginated(PaginationParams())
+        assert response.items[0].status is ResponseStatus.COMPLETED
+        assert response.items[0].total_clips == 2
+        assert response.items[0].settings.get('studio_draft_count', 0) == 3
+
+
+def test_visual_home_counts_drafts_separately_from_multiple_platform_outputs(project):
+    data = state(['completed'] * 4)
+    data['drafts'] = [{'id': 'first'}, {'id': 'second'}]
+    store.settle_generation(data)
+    store.write('visual', data)
+    with project() as db:
+        response = ProjectService(db).get_project_with_stats('visual')
+        assert response.status is ResponseStatus.COMPLETED
+        assert response.total_clips == 4
+        assert response.settings.get('studio_draft_count', 0) == 2
+
+
+@pytest.mark.parametrize('statuses, expected', [
+    (['completed', 'completed'], ProjectStatus.COMPLETED),
+    (['completed', 'failed'], ProjectStatus.FAILED),
+    (['failed', 'failed'], ProjectStatus.FAILED),
+    (['completed', 'queued'], ProjectStatus.PROCESSING),
+    (['completed', 'preparing'], ProjectStatus.PROCESSING),
+])
+def test_render_terminals_and_pending_workers(project, statuses, expected):
+    initial = state(statuses)
+    store.write('visual', initial)
+    jobs._sync_variant_status('visual', 'job-0', statuses[0])
+    with project() as db:
+        assert db.get(Project, 'visual').status is expected
+    assert [item['status'] for item in store.read('visual')['output_variants']] == statuses
+
+
+def test_old_completed_generation_recovers_before_status_filter_without_changing_outputs(project):
+    data = state(['completed', 'on_demand'])
+    store.settle_generation(data)
+    store.write('visual', data)
+    path = store.directory('visual') / 'metadata' / 'studio.json'
+    original = path.read_bytes()
+    with project() as db:
+        result = ProjectService(db).get_projects_paginated(PaginationParams(), ProjectFilter(status=ResponseStatus.COMPLETED))
+        assert [row.id for row in result.items] == ['visual']
+        assert db.get(Project, 'visual').status is ProjectStatus.COMPLETED
+    assert path.read_bytes() == original
+
+
+@pytest.mark.parametrize('bad', ['missing', 'broken', 'nonautomatic'])
+def test_invalid_or_nonautomatic_receipt_does_not_change_project(project, bad):
+    path = store.directory('visual') / 'metadata' / 'studio.json'
+    if bad == 'broken':
+        path.write_text('{')
+    elif bad == 'nonautomatic':
+        data = state(['completed']); store.settle_generation(data); data['generation']['auto_start'] = False
+        store.write('visual', data)
+    with project() as db:
+        response = ProjectService(db).get_project_with_stats('visual')
+        assert response.status is ResponseStatus.PROCESSING
+        assert db.get(Project, 'visual').status is ProjectStatus.PROCESSING
+
+
+def test_busy_index_does_not_fail_saved_video_and_next_list_recovers(project, monkeypatch):
+    from sqlalchemy.exc import OperationalError
+    from backend.services.studio.project_completion import sync_project_completion
+    data = state(['completed']); store.settle_generation(data); store.write('visual', data)
+    path = store.directory('visual') / 'metadata' / 'studio.json'; original = path.read_bytes()
+    with project() as db:
+        with monkeypatch.context() as denied:
+            def busy():
+                raise OperationalError('controlled fixture', {}, Exception('database is locked'))
+            denied.setattr(db, 'commit', busy)
+            assert sync_project_completion('visual', db) is False
+        assert db.get(Project, 'visual').status is ProjectStatus.PROCESSING
+        assert ProjectService(db).get_project_with_stats('visual').status is ResponseStatus.COMPLETED
+    assert path.read_bytes() == original
+
+
+@pytest.mark.parametrize('outcome, expected', [
+    ('completed', ProjectStatus.COMPLETED),
+    ('partial', ProjectStatus.FAILED),
+    ('failed', ProjectStatus.FAILED),
+    ('rendering', ProjectStatus.PROCESSING),
+])
+def test_generation_terminal_leaves_sqlite_even_when_analysis_is_still_running(project, outcome, expected):
+    data = state(['completed', 'failed'] if outcome == 'partial' else ['failed'] if outcome == 'failed' else ['completed', 'running'])
+    data['generation']['status'] = outcome
+    data['analysis']['status'] = 'running'
+    path = store.directory('visual') / 'metadata' / 'studio.json'
+    path.write_text(json.dumps(data), encoding='utf-8')
+    with project() as db:
+        listed = ProjectService(db).get_projects_paginated(PaginationParams(), ProjectFilter(status=ResponseStatus.PROCESSING))
+        row = db.get(Project, 'visual')
+        assert row.status is expected
+        assert [item.id for item in listed.items] == ([] if expected is not ProjectStatus.PROCESSING else ['visual'])
+        if expected is ProjectStatus.PROCESSING:
+            assert 'studio_generation_status' not in (row.processing_config or {})
+        else:
+            assert row.processing_config['studio_generation_status'] == outcome
+            assert (row.completed_at is not None) is (expected is ProjectStatus.COMPLETED)
+        row.status = ProjectStatus.PROCESSING
+        row.completed_at = None
+        db.commit()
+    with project() as db:
+        detail = ProjectService(db).get_project_with_stats('visual')
+        assert detail.status is ResponseStatus(expected.value)
+        assert db.get(Project, 'visual').status is expected
+
+
+@pytest.mark.parametrize('bad', ['[]', '{"generation": []}', '{"generation": {"auto_start": true, "status": "completed"}, "analysis": 1}', '{"generation": {"auto_start": true, "status": "completed"}, "analysis": {"status": "completed"}, "output_variants": [1]}', '{"generation": {"auto_start": true, "status": "completed"}, "analysis": {"status": "completed"}, "drafts": [1]}'])
+def test_malformed_receipt_never_breaks_the_project_list(project, bad):
+    path = store.directory('visual') / 'metadata' / 'studio.json'; path.write_text(bad)
+    with project() as db:
+        assert ProjectService(db).get_projects_paginated(PaginationParams()).items[0].status is ResponseStatus.PROCESSING
+    assert path.read_text() == bad
+
+
+def test_budget_timeout_projects_stage_phase_and_request_count():
+    from backend.services.studio.project_completion import _failure
+    message, code, stage, phase, calls, upstream, secondary = _failure(
+        {'error': '没有自动生成的成片，可选择备选片段继续生成', 'error_code': 'validation'},
+        {
+            'error': '这次制作已超过时间上限，已停止。请重试；服务商一直很慢时可以换一个更快的模型。',
+            'error_code': 'job_budget',
+            'failure_stage': 'analyze',
+            'phase': 'production',
+            'llm_calls': 9,
+        },
+    )
+    assert code == 'job_budget'
+    assert stage == 'analyze'
+    assert phase == 'production'
+    assert calls == 9
+    assert upstream is None
+    assert secondary == ([], [], [])
+    assert '时间上限' in message
+
+
+def test_same_code_keeps_the_generation_stage_and_a_same_run_receipt():
+    from backend.services.studio.project_completion import _failure, preserved_result_count
+    plain = _failure(
+        {'error': '渲染失败', 'error_code': 'provider_error', 'failure_stage': 'render'},
+        {'error': '渲染失败', 'error_code': 'provider_error', 'failure_stage': 'screening', 'phase': 'production', 'run_id': 'run-1'},
+    )
+    assert plain[1] == 'provider_error'
+    assert plain[2] == 'render'
+    message, code, stage, phase, calls, upstream, secondary = _failure(
+        {'error': '渲染失败', 'error_code': 'provider_error', 'failure_stage': 'render'},
+        {'error': '渲染失败', 'error_code': 'provider_error', 'failure_stage': 'screening', 'phase': 'production', 'run_id': 'run-1'},
+        [{'sequence': 2, 'state': 'failed', 'run_id': 'run-1', 'causes': [
+            {'code': 'timeout', 'stage': 'analyze', 'upstream': 'timeout'},
+            {'code': 'insufficient_quota', 'stage': 'analyze', 'upstream': 'insufficient_quota'},
+        ]}],
+    )
+    assert code == 'timeout'
+    assert stage == 'analyze'
+    assert upstream == 'timeout'
+    assert secondary[0] == ['insufficient_quota']
+    assert '渲染失败' in message
+    wrong = _failure(
+        {'error': '频率', 'error_code': 'rate_limited', 'failure_stage': 'render', 'upstream_error_type': 'rate_limited'},
+        {'error': '频率', 'error_code': 'rate_limited', 'failure_stage': 'screening', 'run_id': 'run-1', 'phase': 'production'},
+        [{'sequence': 1, 'state': 'failed', 'run_id': 'other-run', 'causes': [
+            {'code': 'invalid_key', 'stage': 'analyze', 'upstream': 'invalid_key'},
+        ]}],
+    )
+    assert wrong[1] == 'rate_limited'
+    assert wrong[2] == 'render'
+    assert wrong[5] == 'rate_limited'
+    missing_stage = _failure(
+        {'error': '无法连接模型服务。', 'error_code': 'connection'},
+        {'error': '无法连接模型服务。', 'error_code': 'connection', 'failure_stage': 'download', 'run_id': 'run-1'},
+    )
+    assert missing_stage[1] == 'connection'
+    assert missing_stage[2] is None
+    receipt_without_stage = _failure(
+        {'error': '无法连接模型服务。', 'error_code': 'connection'},
+        {'error': '无法连接模型服务。', 'error_code': 'connection', 'failure_stage': 'download', 'run_id': 'run-1'},
+        [{'sequence': 1, 'state': 'failed', 'run_id': 'run-1', 'causes': [
+            {'code': 'connection', 'upstream': 'connection'},
+        ]}],
+    )
+    assert receipt_without_stage[2] is None
+    assert receipt_without_stage[5] == 'connection'
+    wrong_run_stage = _failure(
+        {'error': '无法连接模型服务。', 'error_code': 'connection'},
+        {'error': '无法连接模型服务。', 'error_code': 'connection', 'failure_stage': 'download', 'run_id': 'run-1'},
+        [{'sequence': 1, 'state': 'failed', 'run_id': 'other-run', 'causes': [
+            {'code': 'connection', 'stage': 'download', 'upstream': 'connection'},
+        ]}],
+    )
+    assert wrong_run_stage[2] is None
+    explicit_download = _failure(
+        {'error': '下载中断', 'error_code': 'connection', 'failure_stage': 'download'},
+        {'error': '下载中断', 'error_code': 'connection', 'failure_stage': 'screening', 'run_id': 'run-1'},
+    )
+    assert explicit_download[2] == 'download'
+    assert preserved_result_count([], [], [{'job_id': 'j1', 'status': 'completed'}]) == 1
+    assert preserved_result_count([], [{'status': 'completed', 'render_job_id': 'j1'}], [{'job_id': 'j1', 'status': 'completed'}], 0, 1) == 2
+
+
+def test_failed_generation_mirrors_billable_calls_onto_home_settings(project):
+    """Home ProjectCard reads processing_config.billable_calls_before_failure for 「本次已消耗」."""
+    data = state(['failed'])
+    data['generation'].update(status='failed', error='错误', error_code='provider_error',
+                               billable_calls_before_failure=4)
+    data['analysis'].update(status='failed', billable_calls_before_failure=2)
+    path = store.directory('visual') / 'metadata' / 'studio.json'
+    path.write_text(json.dumps(data), encoding='utf-8')
+    with project() as db:
+        detail = ProjectService(db).get_project_with_stats('visual')
+        assert detail.status is ResponseStatus.FAILED
+        assert detail.settings.get('billable_calls_before_failure') == 4
+        assert db.get(Project, 'visual').processing_config.get('billable_calls_before_failure') == 4
+
+
+def test_list_recovers_confirmed_manual_failure_from_workspace(project):
+    reason = '精彩高光：时间线提取为空：4 个有效候选在字幕边界校正后均未达到最短时长（20 秒）。'
+    with project() as db:
+        row = db.get(Project, 'visual')
+        row.status = ProjectStatus.FAILED
+        row.processing_config = {'smart_import': {'auto_start': False}}
+        db.commit()
+    store.write('visual', {
+        'generation': {'auto_start': False, 'status': 'awaiting_confirmation'},
+        'plan': {'id': 'plan-a', 'confirmed_at': store.now(), 'selected_goals': ['highlight']},
+        'analysis': {'status': 'failed', 'phase': 'production', 'error': reason, 'error_code': 'timeline_empty'},
+    })
+    with project() as db:
+        [listed] = ProjectService(db).get_projects_paginated(PaginationParams()).items
+        assert (listed.error_code, listed.error_message) == ('timeline_empty', reason)

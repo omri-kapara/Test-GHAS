@@ -1,0 +1,503 @@
+import { t } from '../i18n'
+import { useTranslation } from 'react-i18next'
+import React, { useState, useEffect, useRef } from 'react'
+import { Dropdown, message } from 'antd'
+import { useNavigate } from 'react-router-dom'
+import { Project } from '../store/useProjectStore'
+import { projectApi } from '../services/api'
+import { studioApi } from '../features/studio/api'
+import { errorText } from '../features/studio/errorText'
+import { UnifiedStatusBar } from './UnifiedStatusBar'
+import FeedbackDialog from './FeedbackDialog'
+import DiagnosticsDialog from '../features/diagnostics/DiagnosticsDialog'
+import { useSimpleProgressStore } from '../stores/useSimpleProgressStore'
+import { Btn, Dialog, Icon, StatusDot } from '../ui'
+import { llmFailureText } from '../utils/llmFailure'
+import { countPreservedResults, presentFailure, type PrimaryAction } from '../features/studio/failurePresentation'
+import DiagnosePanel from '../features/studio/DiagnosePanel'
+import { stageBrowserCookieRecovery } from '../features/studio/browserCookieRecovery'
+import SwitchModelDialog from '../features/studio/SwitchModelDialog'
+import type { SwitchModelOption } from '../features/studio/switchModelOptions'
+import { weakLocalTimelineFailure } from '../utils/timelineFailure'
+import { isSourceDownloading, readDownloadProgress } from '../utils/downloadProgress'
+// import { 
+//   getProjectStatusConfig, 
+//   calculateProjectProgress, 
+//   normalizeProjectStatus,
+//   getProgressStatus 
+// } from '../utils/statusUtils'
+import dayjs from 'dayjs'
+import relativeTime from 'dayjs/plugin/relativeTime'
+import timezone from 'dayjs/plugin/timezone'
+import utc from 'dayjs/plugin/utc'
+import 'dayjs/locale/zh-cn'
+
+dayjs.extend(relativeTime)
+dayjs.extend(timezone)
+dayjs.extend(utc)
+dayjs.locale('zh-cn')
+
+// Tracks which project ids have already had a best-effort auto-start, surviving
+// component remounts (the list briefly unmounts while HomePage shows its
+// loading spinner). A useRef would reset on every remount and let auto-start
+// fire again, which created an infinite onRetry→loadProjects→remount loop.
+// Project ids are unique per import, so once-per-session is exactly right.
+const autoStartedProjectIds = new Set<string>()
+
+interface ProjectCardProps {
+  project: Project
+  onDelete: (id: string) => void
+  onRetry?: (id: string) => void | Promise<void>
+  onChangeVideo?: () => void
+  onClick?: () => void
+  /** One already-connected replacement. Absent means the card offers model settings. */
+  replacement?: { displayName: string } | null
+  /** X2: usable connections for SwitchModelDialog (F2 try-run ok). */
+  switchOptions?: SwitchModelOption[]
+  /** Usable analysis connection count (includes current; drives switch_model vs settings). */
+  connectionCount?: number
+  /** Catalog provider of the failed analysis binding (sponsor → recharge). */
+  analysisProvider?: string | null
+  onSwitchAndRetry?: (id: string, choice?: { connectionId: string; model: string }) => void | Promise<void>
+}
+
+function suggestLine(name: string) {
+  const text = t('建议换用 {{model}} 后重试', { model: name })
+  const at = text.indexOf(name)
+  if (at < 0) return text
+  return <>{text.slice(0, at)}<strong>{name}</strong>{text.slice(at + name.length)}</>
+}
+
+const ProjectCard: React.FC<ProjectCardProps> = ({ project, onDelete, onRetry, onChangeVideo, onClick, replacement, switchOptions, connectionCount, onSwitchAndRetry }) => {
+  useTranslation()
+  const navigate = useNavigate()
+  const creative = project.settings?.creative || project.processing_config?.creative
+  const isVisual = ['highlight', 'promo'].includes(creative?.goal)
+  const isManaged = isVisual || !!project.settings?.smart_import || !!project.processing_config?.smart_import
+  const [videoThumbnail, setVideoThumbnail] = useState<string | null>(null)
+  const [thumbnailLoading, setThumbnailLoading] = useState(false)
+  const [isRetrying, setIsRetrying] = useState(false)
+  const retryLock = useRef(false)
+  const [retryError, setRetryError] = useState('')
+  const [deleteOpen, setDeleteOpen] = useState(false)
+  const [switchOpen, setSwitchOpen] = useState(false)
+
+  // 获取分类信息
+  const isExample = !!(project.settings?.example || project.processing_config?.example)
+  const getCategoryInfo = (category?: string) => {
+    const categoryMap: Record<string, string> = {
+      default: t("默认"), knowledge: t("知识科普"), business: t("商业财经"),
+      opinion: t("观点评论"), experience: t("经验分享"), speech: t("演讲脱口秀"),
+      content_review: t("内容解说"), entertainment: t("娱乐内容"),
+    }
+    return categoryMap[category || 'default'] || categoryMap.default
+  }
+
+  // 缩略图缓存管理
+  const thumbnailCacheKey = `thumbnail_${project.id}`
+  
+  // 生成项目视频缩略图（带缓存）
+  useEffect(() => {
+    const generateThumbnail = async () => {
+      // 优先使用后端提供的缩略图
+      if (project.thumbnail) {
+        setVideoThumbnail(project.thumbnail)
+        console.log(`使用后端提供的缩略图: ${project.id}`)
+        return
+      }
+      
+      if (!project.video_path) {
+        console.log('项目没有视频路径:', project.id)
+        return
+      }
+      
+      // 检查缓存
+      const cachedThumbnail = localStorage.getItem(thumbnailCacheKey)
+      if (cachedThumbnail) {
+        setVideoThumbnail(cachedThumbnail)
+        return
+      }
+      
+      setThumbnailLoading(true)
+      
+      try {
+        const video = document.createElement('video')
+        video.crossOrigin = 'anonymous'
+        video.muted = true
+        video.preload = 'metadata'
+        
+        // 尝试多个可能的视频文件路径
+        const possiblePaths = [studioApi.source(project.id)]
+        
+        let videoLoaded = false
+        
+        for (const path of possiblePaths) {
+          if (videoLoaded) break
+          
+          try {
+            const videoUrl = path
+            console.log('尝试加载视频:', videoUrl)
+            
+            await new Promise((resolve, reject) => {
+              const timeoutId = setTimeout(() => {
+                reject(new Error(t("视频加载超时")))
+              }, 10000) // 10秒超时
+              
+              video.onloadedmetadata = () => {
+                clearTimeout(timeoutId)
+                console.log('视频元数据加载成功:', videoUrl)
+                video.currentTime = Math.min(5, video.duration / 4) // 取视频1/4处或5秒处的帧
+              }
+              
+              video.onseeked = () => {
+                clearTimeout(timeoutId)
+                try {
+                  const canvas = document.createElement('canvas')
+                  const ctx = canvas.getContext('2d')
+                  if (!ctx) {
+                    reject(new Error(t("无法获取canvas上下文")))
+                    return
+                  }
+                  
+                  // 设置合适的缩略图尺寸
+                  const maxWidth = 320
+                  const maxHeight = 180
+                  const aspectRatio = video.videoWidth / video.videoHeight
+                  
+                  let width = maxWidth
+                  let height = maxHeight
+                  
+                  if (aspectRatio > maxWidth / maxHeight) {
+                    height = maxWidth / aspectRatio
+                  } else {
+                    width = maxHeight * aspectRatio
+                  }
+                  
+                  canvas.width = width
+                  canvas.height = height
+                  ctx.drawImage(video, 0, 0, width, height)
+                  
+                  const thumbnail = canvas.toDataURL('image/jpeg', 0.7)
+                  setVideoThumbnail(thumbnail)
+                  
+                  // 缓存缩略图
+                  try {
+                    localStorage.setItem(thumbnailCacheKey, thumbnail)
+                  } catch (e) {
+                    // 如果localStorage空间不足，清理旧缓存
+                    const keys = Object.keys(localStorage).filter(key => key.startsWith('thumbnail_'))
+                    if (keys.length > 50) { // 保留最多50个缩略图缓存
+                      keys.slice(0, 10).forEach(key => localStorage.removeItem(key))
+                      localStorage.setItem(thumbnailCacheKey, thumbnail)
+                    }
+                  }
+                  
+                  videoLoaded = true
+                  resolve(thumbnail)
+                } catch (error) {
+                  reject(error)
+                }
+              }
+              
+              video.onerror = (error) => {
+                clearTimeout(timeoutId)
+                console.error('视频加载失败:', videoUrl, error)
+                reject(error)
+              }
+              
+              video.src = videoUrl
+            })
+            
+            break // 如果成功加载，跳出循环
+          } catch (error) {
+            console.warn(`路径 ${path} 加载失败:`, error)
+            continue // 尝试下一个路径
+          }
+        }
+        
+        if (!videoLoaded) {
+          console.error('所有视频路径都加载失败')
+        }
+      } catch (error) {
+        console.error('生成缩略图时发生错误:', error)
+      } finally {
+        setThumbnailLoading(false)
+      }
+    }
+    
+    generateThumbnail()
+  }, [project.id, project.video_path, project.thumbnail, thumbnailCacheKey])
+
+  // 片源进度在接口的 settings 上（后端字段名 processing_config）。
+  // 读错字段时进度恒为 0，下面会把所有 pending 画成 5%。
+  const downloadProgress = readDownloadProgress(project)
+  const isDownloading = isSourceDownloading(project)
+  const awaitingConfirmation = project.status === 'pending' && !!(project.settings?.awaiting_confirmation || project.processing_config?.awaiting_confirmation)
+  const isImporting = project.status === 'pending' && !isDownloading && !awaitingConfirmation
+  // An automatic Studio run that ended failed/partial (including one interrupted by a restart,
+  // RC156 #13) is regenerated from the project page (Studio retry → /studio/{id}/analyze, or
+  // per-version retry), not by re-running the import screening.
+  
+  // 状态标准化处理
+  const normalizedStatus = project.status === 'error' ? 'failed' : 
+                          isDownloading ? 'downloading' :
+                          isImporting ? 'importing' : project.status
+  
+  // 调试信息
+  console.log('ProjectCard Debug:', {
+    projectId: project.id,
+    projectStatus: project.status,
+    downloadProgress,
+    isDownloading,
+    isImporting,
+    normalizedStatus,
+    processingConfig: project.processing_config
+  })
+
+  // 自动启动 pending 状态的项目（但不包括下载中的项目）。
+  // 关键：每个项目最多只自动尝试一次，且失败时不弹 toast。
+  // 之前这里把 isRetrying 放进依赖、又在 handleRetry 里翻转 isRetrying，
+  // 导致 effect 反复触发 → 对一个还没下载完的 B站项目疯狂 POST /process（返回
+  // 400 "Video file not found"）→ 满屏「重试失败」。下载完成后后端会自动启动
+  // 流水线，所以这里只需做一次「尽力而为」的启动即可。
+  useEffect(() => {
+    if (
+      !isManaged && project.status === 'pending' &&
+      !isDownloading &&
+      !autoStartedProjectIds.has(project.id)
+    ) {
+      autoStartedProjectIds.add(project.id)
+      // Best-effort, one-shot per project. Uploads (file already present) start
+      // processing; B站 imports whose download isn't done yet return 400 here —
+      // that's fine, the backend auto-starts the pipeline when the download
+      // completes. Silent + no onRetry so this never drives the parent's
+      // toast/reload path.
+      handleRetry({ silent: true })
+    }
+  }, [project.status, project.id, isDownloading, isManaged])
+  
+  // 计算进度百分比
+  const progressPercent = project.status === 'completed' ? 100 : 
+                         project.status === 'failed' ? 0 :
+                         isDownloading ? downloadProgress : // 下载中显示实际下载进度
+                         isImporting ? 5 : // pending状态显示5%进度，表示等待处理
+                         project.current_step && project.total_steps ? 
+                         Math.round((project.current_step / project.total_steps) * 100) : 
+                         project.status === 'processing' ? 10 : 0
+
+  const [feedbackOpen, setFeedbackOpen] = useState(false)
+  const [diagnosticsOpen, setDiagnosticsOpen] = useState(false)
+  const [diagnoseOpen, setDiagnoseOpen] = useState(false)
+  const failedProgress = useSimpleProgressStore((st) => st.getProgress(project.id))
+  const failureContext = {
+    source: 'failure' as const,
+    project_id: project.id,
+    stage: failedProgress?.stage,
+    error_message: project.error_message || failedProgress?.message || undefined,
+    error_code: project.error_code || undefined,
+    unexpected_type: (typeof project.unexpected_type === 'string' ? project.unexpected_type
+      : typeof project.processing_config?.unexpected_type === 'string' ? project.processing_config.unexpected_type
+      : typeof project.settings?.unexpected_type === 'string' ? project.settings.unexpected_type
+      : undefined) || undefined,
+  }
+  const upstream = project.upstream_error_type || project.processing_config?.upstream_error_type || project.settings?.upstream_error_type
+  const upstreamType = typeof upstream === 'string' ? upstream : null
+  const rawFailure = project.error_message || failedProgress?.message
+  const failureText = llmFailureText(rawFailure, project.error_code, upstreamType)
+  // Home card must never show only 「处理失败」/bare 「错误」: promote empty/bare copy via
+  // the same step+reason helper the studio FailureActions use (#491/#500 tip soft).
+  const billableRaw = project.processing_config?.billable_calls_before_failure
+    ?? project.settings?.billable_calls_before_failure
+  const billableCount = Number(billableRaw)
+  const indexed = project.processing_config || {}
+  const mirrored = project.settings || {}
+  const projectedPreserved = indexed.preserved_result_count ?? mirrored.preserved_result_count
+  // Old rows have no preserved_result_count. Use only the counts already on the
+  // project; do not invent collections or export jobs the index never stored.
+  const preservedCount = typeof projectedPreserved === 'number'
+    ? Math.max(0, projectedPreserved)
+    : countPreservedResults({
+      drafts: Number(indexed.studio_draft_count ?? mirrored.studio_draft_count ?? 0) || 0,
+      completedVariants: Number(indexed.studio_completed_variant_count ?? mirrored.studio_completed_variant_count ?? 0) || 0,
+      clips: Number(project.total_clips || 0) || 0,
+    })
+  const requestCount = Number(indexed.llm_calls ?? mirrored.llm_calls)
+  const asStrings = (value: unknown) => Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : undefined
+  const failureView = presentFailure({
+    error: rawFailure,
+    error_code: project.error_code,
+    upstream_error_type: upstreamType,
+    failure_stage: indexed.failure_stage || mirrored.failure_stage,
+    phase: indexed.analysis_phase || mirrored.analysis_phase,
+    preservedCount,
+    connectionCount,
+    llm_calls: Number.isFinite(requestCount) ? requestCount : undefined,
+    billable_calls_before_failure: Number.isFinite(billableCount) ? billableCount : undefined,
+    secondary_error_codes: asStrings(indexed.secondary_error_codes ?? mirrored.secondary_error_codes),
+    secondary_upstream_error_types: asStrings(indexed.secondary_upstream_error_types ?? mirrored.secondary_upstream_error_types),
+    secondary_failure_stages: asStrings(indexed.secondary_failure_stages ?? mirrored.secondary_failure_stages),
+  })
+  const weakLocalTimeline = weakLocalTimelineFailure(failureText || failureView.reason, project.error_code)
+
+  const studioStatus = indexed.studio_generation_status || mirrored.studio_generation_status
+  const handleRetry = async (opts?: { silent?: boolean }) => {
+    if (retryLock.current) return
+    retryLock.current = true
+    setIsRetrying(true)
+    setRetryError('')
+    try {
+      if (isManaged || studioStatus) await studioApi.retry(project.id, { scope: 'project', retry_kind: 'same' })
+      else if (project.status === 'pending') await projectApi.startProcessing(project.id)
+      else await projectApi.retryProcessing(project.id)
+      if (!opts?.silent) await onRetry?.(project.id)
+    } catch (error) {
+      if (!opts?.silent) setRetryError(t(errorText(error)))
+    } finally {
+      retryLock.current = false
+      setIsRetrying(false)
+    }
+  }
+
+  const openSettings = () => navigate('/settings?section=analysis')
+  const openSwitchDialog = () => {
+    if (!onSwitchAndRetry) return
+    if (switchOptions && switchOptions.length) { setSwitchOpen(true); return }
+    // A recommended name is not a selected connection. The user picks one in settings.
+    openSettings()
+  }
+  const confirmSwitch = async (choice: { connectionId: string; model: string }) => {
+    if (retryLock.current || !onSwitchAndRetry) return
+    retryLock.current = true
+    setIsRetrying(true)
+    try { await onSwitchAndRetry(project.id, choice) }
+    finally { retryLock.current = false; setIsRetrying(false); setSwitchOpen(false) }
+  }
+
+  const runPrimary = async (action: PrimaryAction) => {
+    if (retryLock.current) return
+    if (action.id === 'view_results') { navigate(`/project/${project.id}`); return }
+    if (action.id === 'settings' || action.id === 'install_transcription' || action.id === 'quota_check') {
+      navigate(action.destination || '/settings?section=analysis')
+      return
+    }
+    if (action.id === 'browser') { navigate(stageBrowserCookieRecovery(project.source_url)); return }
+    if (action.id === 'change_video') { onChangeVideo?.(); return }
+    if (action.id === 'switch_model') { openSwitchDialog(); return }
+    await handleRetry()
+  }
+
+  const openProject = () => {
+    if (awaitingConfirmation) {
+      // Studio resolves initial imports vs. remakes from the persisted staging flag.
+      navigate(isManaged ? `/project/${project.id}` : `/import/${project.id}`)
+      return
+    }
+    if (!isManaged && project.status === 'pending') {
+      message.warning(t("项目正在导入中，请稍后再查看详情"))
+      return
+    }
+    if (!isManaged && project.status === 'processing') {
+      message.warning(t("项目处理中，请完成后再查看"))
+      return
+    }
+    if (onClick) onClick()
+    else navigate(`/project/${project.id}`)
+  }
+
+  const failed = normalizedStatus === 'failed'
+  const primary = weakLocalTimeline && switchOptions?.length && !preservedCount
+    ? { id: 'switch_model', label: '切换并重试' } as const
+    : failureView.primary
+
+  return (
+    <>
+      <article className={`ac-card ac-project-card${failed ? ' ac-project-card--failed' : ''}`}>
+        <div className="ac-card-thumb" style={{ backgroundImage: videoThumbnail ? `url(${videoThumbnail})` : undefined }}>
+          {(!failed || !weakLocalTimeline) && (
+            <button type="button" className="ac-project-open" aria-label={project.name} onClick={openProject}>
+              {!videoThumbnail && <Icon.Play size={30} />}
+              {thumbnailLoading && <span className="ac-project-thumbnail-loading">{t("生成封面中…")}</span>}
+            </button>
+          )}
+          <div className="ac-project-tags">
+            {isExample && <span className="ac-tag ac-tag--sans">{t("示例")}</span>}
+            {project.video_category && project.video_category !== 'default' && <span className="ac-tag ac-tag--sans">{getCategoryInfo(project.video_category)}</span>}
+          </div>
+        </div>
+        <div className="ac-card-body">
+          {failed ? (
+            <div className="ac-failure-heading">
+              <h3 className="ac-card-title" title={project.name}>{project.name}</h3>
+              <StatusDot tone="error" label={t("处理失败")} />
+            </div>
+          ) : (
+            <button type="button" className="ac-project-title" onClick={openProject} title={project.name}>
+              <span className="ac-card-title">{project.name}</span>
+            </button>
+          )}
+          {normalizedStatus !== 'failed' && (awaitingConfirmation ? (
+            <div className="ac-project-status"><StatusDot tone="muted" label={t("待确认制作类型")} /><Btn size="sm" onClick={openProject}>{t("查看建议")}</Btn></div>
+          ) : isManaged && project.status === 'processing' ? (
+            <StatusDot tone="accent" label={t("制作中 · 查看进度")} />
+          ) : (
+            <UnifiedStatusBar projectId={project.id} status={normalizedStatus} downloadProgress={progressPercent} />
+          ))}
+          {normalizedStatus === 'completed' && (
+            <div className="ac-project-counts ac-mono">
+              {isVisual ? t('成片草稿数量', { count: project.settings?.studio_draft_count || project.processing_config?.studio_draft_count || 0 }) : <>{t("切片数量", { count: project.total_clips || 0 })}<span> · </span>{t("合集数量", { count: project.total_collections || 0 })}</>}
+            </div>
+          )}
+          {failed && (
+            <div className="ac-failure-summary" role="alert">
+              <p className="ac-failure-reason">{t(failureView.brief, failureView.briefValues)}</p>
+              {weakLocalTimeline && replacement?.displayName && <p className="ac-project-weak-suggest">{suggestLine(replacement.displayName)}</p>}
+              {preservedCount > 0 && <p className="ac-failure-outcome">{t(failureView.outcome, { count: preservedCount })}</p>}
+            </div>
+          )}
+          {retryError && <p className="studio-error" role="alert">{retryError}</p>}
+          <div className="ac-card-foot">
+            {failed ? <>
+              <div className="ac-failure-actions" aria-busy={isRetrying}>
+                {primary && <Btn variant="cta" size="sm" loading={isRetrying} onClick={() => runPrimary(primary)}>{t(primary.label)}</Btn>}
+                {primary?.id === 'view_results' && <Btn variant="text" size="sm" disabled={isRetrying} onClick={() => runPrimary(failureView.recovery)}>{t(failureView.recovery.label)}</Btn>}
+                {primary?.id !== 'view_results' && failureView.briefValues && onChangeVideo && <Btn variant="text" size="sm" onClick={onChangeVideo}>{t("换一个视频")}</Btn>}
+              </div>
+              <div className="ac-failure-meta">
+                <time className="meta" dateTime={project.created_at}>{dayjs(project.created_at).fromNow()}</time>
+                <Dropdown trigger={['click']} placement="bottomRight" menu={{ items: [
+                  { key: 'details', label: t('查看详情'), onClick: () => setDiagnoseOpen(true) },
+                  { key: 'diagnostics', label: t('提交诊断'), onClick: () => setDiagnosticsOpen(true) },
+                  { key: 'feedback', label: t('反馈'), onClick: () => setFeedbackOpen(true) },
+                  { type: 'divider' },
+                  { key: 'delete', label: t('删除'), danger: true, onClick: () => setDeleteOpen(true) },
+                ] }}>
+                  <button type="button" className="ac-failure-more" aria-label={t('更多选项')} title={t('更多选项')}>···</button>
+                </Dropdown>
+              </div>
+            </> : <>
+              <time className="meta" dateTime={project.created_at}>{dayjs(project.created_at).fromNow()}</time>
+              <div className="ac-card-actions">
+                {(normalizedStatus === 'processing' || normalizedStatus === 'importing') && !isManaged && <Btn variant="text" size="sm" loading={isRetrying} onClick={() => handleRetry()} title={t("重新提交任务")}><Icon.Refresh /></Btn>}
+                <Btn variant="danger" size="sm" onClick={() => setDeleteOpen(true)} title={t("删除")} aria-label={t("删除")}><Icon.Trash /></Btn>
+              </div>
+            </>}
+          </div>
+        </div>
+      </article>
+      <Dialog open={deleteOpen} onClose={() => setDeleteOpen(false)} title={t("确定要删除这个项目吗？")} description={t("删除后无法恢复")}
+        footer={<div className="right"><Btn onClick={() => setDeleteOpen(false)}>{t("取消")}</Btn><Btn variant="danger" onClick={() => { setDeleteOpen(false); onDelete(project.id) }}>{t("确定")}</Btn></div>} />
+      <FeedbackDialog open={feedbackOpen} onClose={() => setFeedbackOpen(false)} context={failureContext} />
+      <DiagnosticsDialog open={diagnosticsOpen} onClose={() => setDiagnosticsOpen(false)} projectId={project.id} />
+      <DiagnosePanel open={diagnoseOpen} onClose={() => setDiagnoseOpen(false)} info={{ error: rawFailure, error_code: project.error_code, upstream_error_type: upstreamType, failure_stage: project.processing_config?.failure_stage || project.settings?.failure_stage, llm_calls: Number.isFinite(requestCount) ? requestCount : undefined, billable_calls_before_failure: Number.isFinite(billableCount) ? billableCount : undefined }} reason={failureView.reason} onSettings={destination => navigate(destination)} />
+      <SwitchModelDialog
+        open={switchOpen}
+        options={switchOptions || []}
+        busy={isRetrying}
+        onClose={() => setSwitchOpen(false)}
+        onConfirm={(choice) => void confirmSwitch(choice)}
+      />
+    </>
+  )
+}
+
+export default ProjectCard
